@@ -4,64 +4,56 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import logging
 import sys
-import asyncio
-import aiohttp
 from contextlib import asynccontextmanager
+import aiohttp
+import tempfile
+import os
 from urllib.parse import urlparse
 
 from app.config import settings
 from app.models import (
-    VideoDownloadRequest,
-    VideoDownloadResponse,
+    VideoDownloadRequest, 
+    VideoDownloadResponse, 
+    ErrorResponse,
+    VideoQuality
+)
+from app.services.video_service import video_service
+from app.utils.rate_limiter import check_rate_limit
+import sys
+from contextlib import asynccontextmanager
+
+from app.config import settings
+from app.models import (
+    VideoDownloadRequest, 
+    VideoDownloadResponse, 
     ErrorResponse,
     VideoQuality
 )
 from app.services.video_service import video_service
 from app.utils.rate_limiter import check_rate_limit
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Configure logging
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lifespan
-# ──────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup
     logger.info("🚀 Facebook Video Downloader API starting up...")
     logger.info(f"Debug mode: {settings.DEBUG}")
-    logger.info(
-        f"Rate limiting: {settings.RATE_LIMIT_REQUESTS} req / {settings.RATE_LIMIT_WINDOW}s"
-    )
-    # Check ffmpeg availability at startup
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'ffmpeg', '-version',
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        logger.info("✅ ffmpeg is available — DASH merge enabled")
-    except FileNotFoundError:
-        logger.warning(
-            "⚠️  ffmpeg NOT found — DASH videos will stream video-only (no audio). "
-            "Install ffmpeg to enable audio merging."
-        )
+    logger.info(f"Rate limiting: {settings.RATE_LIMIT_REQUESTS} requests per {settings.RATE_LIMIT_WINDOW}s")
     yield
+    # Shutdown
     logger.info("📱 Facebook Video Downloader API shutting down...")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Initialize FastAPI app
 app = FastAPI(
     title=settings.API_TITLE,
     version=settings.API_VERSION,
@@ -71,8 +63,10 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -81,354 +75,205 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Global exception handler
-# ──────────────────────────────────────────────────────────────────────────────
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    
     return JSONResponse(
         status_code=500,
         content={
             "status": "error",
             "message": "Internal server error occurred",
-            "error_code": "INTERNAL_ERROR",
-        },
+            "error_code": "INTERNAL_ERROR"
+        }
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Root endpoint - serve the main page
 @app.get("/")
 async def root():
     """Serve the main HTML page"""
     from fastapi.responses import FileResponse
     return FileResponse("static/index.html")
 
-
+# Health check endpoint
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
         "version": settings.API_VERSION,
-        "service": "Facebook Video Downloader API",
+        "service": "Facebook Video Downloader API"
     }
 
-
+# Main video download endpoint
 @app.post("/download", response_model=VideoDownloadResponse)
 async def download_video(
     request: VideoDownloadRequest,
-    _: None = Depends(check_rate_limit),
+    _: None = Depends(check_rate_limit)
 ):
     """
-    Download Facebook video — returns direct URL or /stream/ URL for DASH videos.
-
+    Download Facebook video and get direct download link
+    
     - **url**: Facebook video URL (required)
-    - **quality**: Preferred quality (optional, default: best)
+    - **quality**: Preferred video quality (optional, default: best)
+    
+    Returns video information and direct download URL.
     """
+    
     try:
-        logger.info(f"Processing download request: {request.url}")
-
-        result = await video_service.get_video_info(str(request.url), request.quality)
-
+        logger.info(f"Processing video download request: {request.url}")
+        
+        # Extract video information
+        result = await video_service.get_video_info(
+            str(request.url), 
+            request.quality
+        )
+        
         response = VideoDownloadResponse(
             status="success",
             video_info=result['video_info'],
             download_url=result['download_url'],
-            available_formats=result['available_formats'],
+            available_formats=result['available_formats']
         )
-
-        logger.info(f"Successfully processed: {result['video_info'].title}")
+        
+        logger.info(f"Successfully processed video: {result['video_info'].title}")
         return response
-
+        
     except ValueError as e:
-        logger.warning(f"Invalid request: {e}")
+        logger.warning(f"Invalid request: {str(e)}")
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": str(e), "error_code": "INVALID_REQUEST"},
+            detail={
+                "status": "error",
+                "message": str(e),
+                "error_code": "INVALID_REQUEST"
+            }
         )
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"status": "error", "message": "Failed to process video", "error_code": "PROCESSING_ERROR"},
+            detail={
+                "status": "error",
+                "message": "Failed to process video",
+                "error_code": "PROCESSING_ERROR"
+            }
         )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Stream endpoint — handles both simple proxy and ffmpeg DASH merge
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _is_safe_url(url: str) -> bool:
-    """Basic URL safety check"""
-    try:
-        parsed = urlparse(url)
-        valid = bool(parsed.scheme in ('http', 'https') and parsed.netloc)
-        if not valid:
-            logger.warning(f"URL validation failed — scheme={parsed.scheme!r} netloc={parsed.netloc!r} url_prefix={url[:100]!r}")
-        return valid
-    except Exception as e:
-        logger.warning(f"URL parse error: {e} — url_prefix={url[:100]!r}")
-        return False
-
-
-async def _simple_proxy(url: str):
-    """Stream a single URL through (progressive MP4 or video-only fallback)"""
-    timeout = aiohttp.ClientTimeout(total=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(
-            url,
-            headers={
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/120.0.0.0 Safari/537.36'
-                )
-            },
-        ) as resp:
-            if resp.status != 200:
-                raise HTTPException(status_code=resp.status, detail="Failed to fetch video")
-            async for chunk in resp.content.iter_chunked(8192):
-                yield chunk
-
-
-async def _download_to_temp(url: str, suffix: str) -> str:
-    """
-    Facebook CDN URL থেকে temp file এ download করো।
-    ffmpeg direct URL এ ভালো কাজ করে না (403/redirect), তাই আগে download করি।
-    """
-    import tempfile
-    import os
-
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        ),
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.facebook.com/',
-        'Origin': 'https://www.facebook.com',
-    }
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    try:
-        timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    raise ValueError(f"Failed to download ({resp.status}): {url[:80]}")
-                async for chunk in resp.content.iter_chunked(65536):
-                    tmp.write(chunk)
-        tmp.close()
-        logger.info(f"Downloaded temp file: {tmp.name} ({os.path.getsize(tmp.name)} bytes)")
-        return tmp.name
-    except Exception:
-        tmp.close()
-        os.unlink(tmp.name)
-        raise
-
-
-async def _ffmpeg_merge(video_url: str, audio_url: str):
-    """
-    DASH video + audio আলাদাভাবে temp file এ download করে
-    ffmpeg দিয়ে merge করে stream করো।
-
-    Strategy:
-    1. video + audio আলাদা temp file এ download
-    2. ffmpeg দিয়ে merge → stdout pipe
-    3. chunk করে client এ stream
-    4. temp files cleanup
-    """
-    import os
-
-    video_tmp = None
-    audio_tmp = None
-    proc = None
-
-    try:
-        # Step 1: Download both streams to temp files
-        logger.info("Downloading video stream to temp file...")
-        video_tmp = await _download_to_temp(video_url, '.mp4')
-
-        logger.info("Downloading audio stream to temp file...")
-        audio_tmp = await _download_to_temp(audio_url, '.m4a')
-
-        # Step 2: ffmpeg merge from temp files
-        cmd = [
-            'ffmpeg',
-            '-loglevel', 'warning',
-            '-i', video_tmp,
-            '-i', audio_tmp,
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-shortest',
-            '-f', 'mp4',
-            '-movflags', 'frag_keyframe+empty_moov+faststart',
-            'pipe:1',
-        ]
-
-        logger.info("Starting ffmpeg merge from temp files")
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # Step 3: Stream output chunks
-        while True:
-            chunk = await proc.stdout.read(65536)
-            if not chunk:
-                break
-            yield chunk
-
-        await proc.wait()
-
-        stderr_out = await proc.stderr.read()
-        if proc.returncode != 0:
-            logger.error(f"ffmpeg error (code {proc.returncode}): {stderr_out.decode()}")
-        else:
-            logger.info("ffmpeg merge completed successfully")
-            if stderr_out:
-                logger.debug(f"ffmpeg warnings: {stderr_out.decode()}")
-
-    except Exception as e:
-        logger.error(f"ffmpeg merge error: {e}")
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        raise
-
-    finally:
-        # Step 4: Cleanup temp files
-        for tmp_path in (video_tmp, audio_tmp):
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                    logger.debug(f"Cleaned up temp file: {tmp_path}")
-                except Exception:
-                    pass
-
-
+# Streaming download endpoint  
 @app.get("/stream/{video_id}")
-async def stream_video(video_id: str, url: str, audio_url: str = None):
+async def stream_video(video_id: str, url: str):
     """
-    Stream video through the server.
-
-    - If only **url** is provided → simple proxy (progressive MP4)
-    - If **audio_url** is also provided → ffmpeg merges DASH video+audio on the fly
+    Stream video file directly through our server to avoid CORS issues
     """
-    # Validate URLs — simple scheme check only
-    # (Facebook CDN URLs are long and complex, avoid over-validation)
-    logger.info(f"Stream request: video_id={video_id} url_start={url[:60]!r} audio={'yes' if audio_url else 'no'}")
-    if not url.startswith(('http://', 'https://')):
-        logger.warning(f"Rejected URL: {url[:120]!r}")
-        raise HTTPException(status_code=400, detail="Invalid video URL")
-    if audio_url and not audio_url.startswith(('http://', 'https://')):
-        logger.warning(f"Rejected audio URL: {audio_url[:120]!r}")
-        raise HTTPException(status_code=400, detail="Invalid audio URL")
-
-    filename = f"{video_id}.mp4"
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": "video/mp4",
-        "Cache-Control": "no-cache",
-        "Access-Control-Expose-Headers": "Content-Disposition",
-    }
-
     try:
-        if audio_url:
-            # DASH: merge with ffmpeg
-            logger.info(f"DASH merge stream: video_id={video_id}")
-            return StreamingResponse(
-                _ffmpeg_merge(url, audio_url),
-                media_type="video/mp4",
-                headers=headers,
-            )
-        else:
-            # Progressive: simple proxy
-            logger.info(f"Simple proxy stream: video_id={video_id}")
-            return StreamingResponse(
-                _simple_proxy(url),
-                media_type="video/mp4",
-                headers=headers,
-            )
-
-    except HTTPException:
-        raise
+        logger.info(f"Streaming video: {url}")
+        
+        # Validate URL
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise HTTPException(status_code=400, detail="Invalid URL")
+        
+        async def generate():
+            timeout = aiohttp.ClientTimeout(total=600)  # 10 minutes timeout
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                try:
+                    async with session.get(
+                        url, 
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        }
+                    ) as response:
+                        if response.status != 200:
+                            raise HTTPException(status_code=response.status, detail="Failed to fetch video")
+                        
+                        chunk_size = 8192
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            yield chunk
+                            
+                except Exception as e:
+                    logger.error(f"Streaming error: {str(e)}")
+                    raise
+        
+        return StreamingResponse(
+            generate(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"{video_id}.mp4\"",
+                "Content-Type": "video/mp4",
+                "Cache-Control": "no-cache",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+        
     except Exception as e:
-        logger.error(f"Stream error: {e}")
+        logger.error(f"Stream error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to stream video")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Info-only endpoint
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Get video info without download
 @app.post("/info", response_model=VideoDownloadResponse)
 async def get_video_info(
     request: VideoDownloadRequest,
-    _: None = Depends(check_rate_limit),
+    _: None = Depends(check_rate_limit)
 ):
-    """Get Facebook video metadata without a download URL"""
+    """
+    Get Facebook video information without download URL
+    
+    - **url**: Facebook video URL (required)
+    
+    Returns video metadata only.
+    """
+    
     try:
-        logger.info(f"Processing info request: {request.url}")
-
-        result = await video_service.get_video_info(str(request.url), request.quality)
-
+        logger.info(f"Processing video info request: {request.url}")
+        
+        result = await video_service.get_video_info(
+            str(request.url), 
+            request.quality
+        )
+        
         response = VideoDownloadResponse(
             status="success",
             video_info=result['video_info'],
-            available_formats=result['available_formats'],
+            available_formats=result['available_formats']
         )
-
-        logger.info(f"Info retrieved: {result['video_info'].title}")
+        
+        logger.info(f"Successfully retrieved info: {result['video_info'].title}")
         return response
-
+        
     except ValueError as e:
-        logger.warning(f"Invalid request: {e}")
+        logger.warning(f"Invalid request: {str(e)}")
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": str(e), "error_code": "INVALID_REQUEST"},
+            detail={
+                "status": "error",
+                "message": str(e),
+                "error_code": "INVALID_REQUEST"
+            }
         )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ──────────────────────────────────────────────────────────────────────────────
-
+# Get supported quality options
 @app.get("/qualities")
 async def get_supported_qualities():
     """Get list of supported video qualities"""
     return {
         "status": "success",
-        "qualities": [q.value for q in VideoQuality],
+        "qualities": [quality.value for quality in VideoQuality],
         "descriptions": {
-            "best":  "Best available quality",
-            "worst": "Worst available quality",
-            "360p":  "360p resolution",
-            "720p":  "720p resolution",
-            "1080p": "1080p resolution",
-        },
+            "best": "Best available quality",
+            "worst": "Worst available quality", 
+            "360p": "360p resolution",
+            "720p": "720p resolution",
+            "1080p": "1080p resolution"
+        }
     }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dev runner
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "app.main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.DEBUG,
+        "app.main:app", 
+        host=settings.HOST, 
+        port=settings.PORT, 
+        reload=settings.DEBUG
     )
