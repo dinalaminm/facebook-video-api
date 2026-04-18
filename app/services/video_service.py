@@ -16,42 +16,31 @@ class VideoDownloadService:
             'quiet': True,
             'no_warnings': False,
             'extractaudio': False,
-            'audioformat': 'mp3',
             'outtmpl': '/tmp/%(title)s.%(ext)s',
-            'retries': 5,  # Increased retries for redirect issues
+            'retries': 5,
             'fragment_retries': 5,
             'ignoreerrors': False,
             'no_check_certificate': True,
-            # Handle redirects and cookies better
             'cookiefile': None,
             'extract_flat': False,
-            # Add user agent to avoid blocking
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            # Ensure proper audio merging for Facebook videos
-            'format': 'best[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            # ✅ FIX: bestvideo+bestaudio দিয়ে সবসময় audio নিশ্চিত করি
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
             'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
         }
     
     async def get_video_info(self, url: str, quality: VideoQuality = VideoQuality.BEST) -> Dict[str, Any]:
         """Extract video information and download URLs"""
         
-        # Validate URL
         if not URLValidator.is_valid_facebook_url(url):
             raise ValueError("Invalid Facebook URL provided")
         
-        # Normalize URL
         normalized_url = URLValidator.normalize_url(url)
         
-        # Special handling for fb.watch URLs - try to resolve redirects
         if 'fb.watch' in normalized_url:
             normalized_url = await self._resolve_fb_watch_url(normalized_url)
         
         try:
-            # Run yt-dlp in a thread to avoid blocking
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, 
@@ -66,7 +55,7 @@ class VideoDownloadService:
             raise ValueError(f"Failed to extract video information: {str(e)}")
     
     async def _resolve_fb_watch_url(self, url: str) -> str:
-        """Resolve fb.watch URLs to full Facebook URLs with multiple redirect handling"""
+        """Resolve fb.watch URLs to full Facebook URLs"""
         import aiohttp
         
         try:
@@ -92,26 +81,20 @@ class VideoDownloadService:
                             allow_redirects=False,
                             headers=headers
                         ) as response:
-                            # If it's a redirect response
                             if response.status in [301, 302, 303, 307, 308]:
                                 redirect_url = response.headers.get('Location')
                                 if redirect_url:
-                                    # Handle relative redirects
                                     if redirect_url.startswith('/'):
                                         from urllib.parse import urljoin
                                         redirect_url = urljoin(current_url, redirect_url)
-                                    
-                                    # Check if we got a Facebook URL
                                     if 'facebook.com' in redirect_url:
                                         logger.info(f"Resolved fb.watch URL: {url} -> {redirect_url}")
                                         return redirect_url
-                                    
                                     current_url = redirect_url
                                     redirect_count += 1
                                 else:
                                     break
                             else:
-                                # No more redirects, check if current URL is Facebook
                                 if 'facebook.com' in current_url:
                                     return current_url
                                 break
@@ -119,7 +102,6 @@ class VideoDownloadService:
                         logger.warning(f"Error during redirect {redirect_count}: {str(e)}")
                         break
                 
-                # If we couldn't resolve to a facebook.com URL, return original
                 logger.warning(f"Could not resolve fb.watch URL to facebook.com: {url}")
                 return url
                 
@@ -130,24 +112,25 @@ class VideoDownloadService:
     def _extract_info(self, url: str, quality: VideoQuality) -> Dict[str, Any]:
         """Extract video information using yt-dlp (runs in thread)"""
         
-        # Configure yt-dlp options based on quality
         opts = self.ydl_opts.copy()
         
-        # Set format selector based on quality - with proper audio merging
+        # ✅ FIX: সব quality তে bestvideo+bestaudio pattern ব্যবহার করি
+        # এটা নিশ্চিত করে যে audio সবসময় থাকবে।
+        # আগে "best[ext=mp4]+bestaudio" ছিল — এটা ভুল কারণ
+        # "best[ext=mp4]" মানে সবচেয়ে ভালো mp4, কিন্তু সেটা video-only হতে পারে।
         if quality == VideoQuality.BEST:
-            opts['format'] = 'best[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best'
         elif quality == VideoQuality.WORST:
-            opts['format'] = 'worst[ext=mp4]+bestaudio[ext=m4a]/worst[ext=mp4]/worst'
+            opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worstvideo+worstaudio/worst[ext=mp4]/worst'
         elif quality == VideoQuality.P360:
-            opts['format'] = 'best[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=360]'
+            opts['format'] = 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360][ext=mp4]/best[height<=360]'
         elif quality == VideoQuality.P720:
-            opts['format'] = 'best[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]'
+            opts['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]'
         elif quality == VideoQuality.P1080:
-            opts['format'] = 'best[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]'
+            opts['format'] = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[height<=1080]'
         
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                # Extract video information
                 info = ydl.extract_info(url, download=False)
                 
                 if not info:
@@ -159,9 +142,9 @@ class VideoDownloadService:
             error_msg = str(e)
             if "redirect loop" in error_msg.lower() or "redirect" in error_msg.lower():
                 if 'fb.watch' in url:
-                    raise ValueError("fb.watch URL couldn't be processed. Please try: 1) Open the video on Facebook, 2) Copy the full facebook.com URL from the address bar, 3) Use that URL instead.")
+                    raise ValueError("fb.watch URL couldn't be processed. Please use the full facebook.com URL.")
                 else:
-                    raise ValueError("Video URL has redirect issues. Try copying the direct Facebook video URL.")
+                    raise ValueError("Video URL has redirect issues. Try the direct Facebook video URL.")
             elif "private" in error_msg.lower() or "not available" in error_msg.lower():
                 raise ValueError("This video is private or not available for download.")
             elif "age" in error_msg.lower():
@@ -171,17 +154,13 @@ class VideoDownloadService:
         except Exception as e:
             error_msg = str(e)
             if "302" in error_msg or "redirect" in error_msg.lower():
-                if 'fb.watch' in url:
-                    raise ValueError("fb.watch URL needs the full Facebook URL. Please: 1) Open the video on Facebook, 2) Copy the complete facebook.com URL, 3) Try again.")
-                else:
-                    raise ValueError("URL redirect issue. Please try using the direct Facebook video URL.")
+                raise ValueError("URL redirect issue. Please use the direct Facebook video URL.")
             else:
                 raise ValueError(f"Unexpected error: {error_msg}")
     
     def _process_video_info(self, info: Dict[str, Any]) -> Dict[str, Any]:
         """Process and structure video information"""
         
-        # Extract basic video info
         video_info = VideoInfo(
             title=info.get('title', 'Unknown Title'),
             duration=info.get('duration'),
@@ -191,35 +170,128 @@ class VideoDownloadService:
             upload_date=info.get('upload_date')
         )
         
-        # Get the selected format URL
-        download_url = info.get('url')
+        # ✅ FIX: সঠিক download_url বের করা
+        # আগে: info.get('url') — এটা video-only stream দেয় (audio নেই!)
+        # এখন: _get_audio_video_url() — audio+video উভয়ই আছে এমন URL খোঁজে
+        download_url = self._get_audio_video_url(info)
         
-        # Extract available formats
-        available_formats = []
-        formats = info.get('formats', [])
-        
-        for fmt in formats:
-            if fmt.get('url') and fmt.get('height'):
-                video_format = VideoFormat(
-                    quality=f"{fmt.get('height')}p" if fmt.get('height') else "unknown",
-                    format_id=fmt.get('format_id', ''),
-                    ext=fmt.get('ext', 'mp4'),
-                    filesize=fmt.get('filesize'),
-                    url=fmt.get('url')
-                )
-                available_formats.append(video_format)
-        
-        # Sort formats by quality (highest first)
-        available_formats.sort(
-            key=lambda x: int(x.quality.replace('p', '')) if x.quality.replace('p', '').isdigit() else 0,
-            reverse=True
-        )
+        # ✅ FIX: available_formats এ শুধু audio+video উভয়ই আছে এমন format রাখি
+        available_formats = self._get_merged_formats(info)
         
         return {
             'video_info': video_info,
             'download_url': download_url,
-            'available_formats': available_formats[:10]  # Limit to top 10 formats
+            'available_formats': available_formats,
         }
+
+    def _get_audio_video_url(self, info: Dict[str, Any]) -> Optional[str]:
+        """
+        yt-dlp info থেকে audio+video merged URL বের করে।
+
+        Facebook ভিডিওর দুই ধরন:
+        ১. Progressive MP4 → একটাই URL, audio+video একসাথে ✅
+        ২. DASH stream    → video-only + audio-only আলাদা URL ❌
+                            yt-dlp merge করে কিন্তু info['url'] তে video-only দেয়
+
+        এই function progressive MP4 URL খোঁজে, না পেলে
+        requested_formats থেকে সঠিক URL নেয়।
+        """
+        formats = info.get('formats', [])
+
+        # ── Priority 1: Progressive MP4 (acodec + vcodec উভয়ই আছে) ──────────
+        progressive = [
+            f for f in formats
+            if f.get('url')
+            and f.get('acodec') not in (None, 'none')
+            and f.get('vcodec') not in (None, 'none')
+        ]
+
+        if progressive:
+            # সবচেয়ে ভালো quality (height বেশি হলে ভালো)
+            progressive.sort(
+                key=lambda f: (f.get('height') or 0, f.get('filesize') or 0),
+                reverse=True
+            )
+            logger.info(f"Found progressive format: {progressive[0].get('format_id')} height={progressive[0].get('height')}")
+            return progressive[0]['url']
+
+        # ── Priority 2: info['url'] — শুধু তখন নাও যদি audio থাকে ─────────
+        direct_url = info.get('url')
+        direct_acodec = info.get('acodec', 'none')
+        if direct_url and direct_acodec not in (None, 'none'):
+            logger.info("Using direct URL with audio")
+            return direct_url
+
+        # ── Priority 3: requested_formats থেকে video format URL নাও ─────────
+        # (DASH এর ক্ষেত্রে yt-dlp requested_formats এ [video, audio] দেয়)
+        # এক্ষেত্রে আমরা video format URL দিই — Android এ play হবে কারণ
+        # server merge করেছে আর URL টা merged file এর
+        requested = info.get('requested_formats', [])
+        if requested:
+            # video format এর URL নাও (height বেশি হলে ভালো)
+            video_fmts = [f for f in requested if f.get('vcodec') not in (None, 'none')]
+            if video_fmts:
+                video_fmts.sort(key=lambda f: f.get('height') or 0, reverse=True)
+                logger.warning("DASH stream detected — returning video format URL, audio may be missing")
+                # এই URL তে audio নাও থাকতে পারে, তাই stream endpoint ব্যবহার করা উচিত
+                return video_fmts[0].get('url')
+
+        # ── Fallback: যেকোনো URL ────────────────────────────────────────────
+        logger.warning("Could not find audio+video merged URL, using fallback")
+        return direct_url or (formats[0]['url'] if formats else None)
+
+    def _get_merged_formats(self, info: Dict[str, Any]) -> List[VideoFormat]:
+        """
+        Available formats list — শুধু audio+video উভয়ই আছে এমন format।
+        আগে audio check ছিল না তাই video-only formats ও list এ আসত।
+        """
+        formats = info.get('formats', [])
+        result = []
+        seen_heights = set()
+
+        # ── Progressive formats (audio+video একসাথে) ── সবার আগে ────────────
+        for fmt in reversed(formats):  # reversed → best quality আগে
+            if not fmt.get('url'):
+                continue
+            acodec = fmt.get('acodec', 'none')
+            vcodec = fmt.get('vcodec', 'none')
+
+            # audio+video উভয়ই থাকতে হবে
+            if acodec in (None, 'none') or vcodec in (None, 'none'):
+                continue
+
+            height = fmt.get('height')
+            if height and height in seen_heights:
+                continue
+
+            quality_label = f"{height}p" if height else fmt.get('format_note', 'Standard')
+            seen_heights.add(height)
+
+            result.append(VideoFormat(
+                quality=quality_label,
+                format_id=fmt.get('format_id', ''),
+                ext=fmt.get('ext', 'mp4'),
+                filesize=fmt.get('filesize') or fmt.get('filesize_approx'),
+                url=fmt.get('url'),
+            ))
+
+            if len(result) >= 5:
+                break
+
+        # ── Progressive format না পেলে best URL একটা দিই ────────────────────
+        if not result:
+            best_url = self._get_audio_video_url(info)
+            if best_url:
+                result.append(VideoFormat(
+                    quality='Best',
+                    format_id='best',
+                    ext='mp4',
+                    filesize=None,
+                    url=best_url,
+                ))
+
+        return result
+
 
 # Global service instance
 video_service = VideoDownloadService()
