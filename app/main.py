@@ -166,8 +166,12 @@ def _is_safe_url(url: str) -> bool:
     """Basic URL safety check"""
     try:
         parsed = urlparse(url)
-        return bool(parsed.scheme in ('http', 'https') and parsed.netloc)
-    except Exception:
+        valid = bool(parsed.scheme in ('http', 'https') and parsed.netloc)
+        if not valid:
+            logger.warning(f"URL validation failed — scheme={parsed.scheme!r} netloc={parsed.netloc!r} url_prefix={url[:100]!r}")
+        return valid
+    except Exception as e:
+        logger.warning(f"URL parse error: {e} — url_prefix={url[:100]!r}")
         return False
 
 
