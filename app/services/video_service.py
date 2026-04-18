@@ -303,8 +303,12 @@ class VideoDownloadService:
         """
         Build the /stream/ endpoint URL for DASH videos.
         The stream endpoint will use ffmpeg to merge video+audio on the fly.
+
+        IMPORTANT: Facebook CDN URLs contain '&' characters, so we must
+        use quote() (not urlencode) to properly percent-encode each URL
+        before embedding it as a query parameter value.
         """
-        from urllib.parse import urlencode
+        from urllib.parse import urlencode, quote
 
         dash = self._get_dash_urls(info)
         video_url = dash.get('video')
@@ -315,11 +319,14 @@ class VideoDownloadService:
             return info.get('url')
 
         video_id = info.get('id', 'video')
-        params = {'url': video_url}
-        if audio_url:
-            params['audio_url'] = audio_url
 
-        stream_path = f"/stream/{video_id}?{urlencode(params)}"
+        # Use quote() to encode each URL value — this handles '&', '?', '=' etc.
+        params = [('url', video_url)]
+        if audio_url:
+            params.append(('audio_url', audio_url))
+
+        query_string = urlencode(params, quote_via=quote)
+        stream_path = f"/stream/{video_id}?{query_string}"
         logger.info(f"Built stream URL: /stream/{video_id} (audio={'yes' if audio_url else 'no'})")
         return stream_path
 
@@ -370,7 +377,7 @@ class VideoDownloadService:
 
         else:
             # ── DASH: expose height options via /stream/ endpoint ─────────────
-            from urllib.parse import urlencode
+            from urllib.parse import urlencode, quote
 
             # Collect distinct video-only heights
             video_fmts = sorted(
@@ -405,11 +412,12 @@ class VideoDownloadService:
                     continue
                 seen_heights.add(height)
 
-                params = {'url': vfmt['url']}
+                # Use quote_via=quote to properly encode Facebook CDN URLs
+                params = [('url', vfmt['url'])]
                 if best_audio_url:
-                    params['audio_url'] = best_audio_url
+                    params.append(('audio_url', best_audio_url))
 
-                stream_url = f"/stream/{video_id}?{urlencode(params)}"
+                stream_url = f"/stream/{video_id}?{urlencode(params, quote_via=quote)}"
                 result.append(VideoFormat(
                     quality=f"{height}p",
                     format_id=vfmt.get('format_id', ''),
