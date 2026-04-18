@@ -325,10 +325,14 @@ async def stream_video(video_id: str, url: str, audio_url: str = None):
     - If only **url** is provided → simple proxy (progressive MP4)
     - If **audio_url** is also provided → ffmpeg merges DASH video+audio on the fly
     """
-    # Validate URLs
-    if not _is_safe_url(url):
+    # Validate URLs — simple scheme check only
+    # (Facebook CDN URLs are long and complex, avoid over-validation)
+    logger.info(f"Stream request: video_id={video_id} url_start={url[:60]!r} audio={'yes' if audio_url else 'no'}")
+    if not url.startswith(('http://', 'https://')):
+        logger.warning(f"Rejected URL: {url[:120]!r}")
         raise HTTPException(status_code=400, detail="Invalid video URL")
-    if audio_url and not _is_safe_url(audio_url):
+    if audio_url and not audio_url.startswith(('http://', 'https://')):
+        logger.warning(f"Rejected audio URL: {audio_url[:120]!r}")
         raise HTTPException(status_code=400, detail="Invalid audio URL")
 
     filename = f"{video_id}.mp4"
