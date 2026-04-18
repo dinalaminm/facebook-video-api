@@ -191,65 +191,126 @@ async def _simple_proxy(url: str):
                 yield chunk
 
 
+async def _download_to_temp(url: str, suffix: str) -> str:
+    """
+    Facebook CDN URL থেকে temp file এ download করো।
+    ffmpeg direct URL এ ভালো কাজ করে না (403/redirect), তাই আগে download করি।
+    """
+    import tempfile
+    import os
+
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.facebook.com/',
+        'Origin': 'https://www.facebook.com',
+    }
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"Failed to download ({resp.status}): {url[:80]}")
+                async for chunk in resp.content.iter_chunked(65536):
+                    tmp.write(chunk)
+        tmp.close()
+        logger.info(f"Downloaded temp file: {tmp.name} ({os.path.getsize(tmp.name)} bytes)")
+        return tmp.name
+    except Exception:
+        tmp.close()
+        os.unlink(tmp.name)
+        raise
+
+
 async def _ffmpeg_merge(video_url: str, audio_url: str):
     """
-    Merge separate DASH video + audio streams using ffmpeg and pipe to client.
+    DASH video + audio আলাদাভাবে temp file এ download করে
+    ffmpeg দিয়ে merge করে stream করো।
 
-    ffmpeg reads both URLs directly (no temp files), merges them, and writes
-    fragmented MP4 to stdout which we stream to the browser/client.
+    Strategy:
+    1. video + audio আলাদা temp file এ download
+    2. ffmpeg দিয়ে merge → stdout pipe
+    3. chunk করে client এ stream
+    4. temp files cleanup
     """
-    cmd = [
-        'ffmpeg',
-        '-loglevel', 'error',
-        # Video input
-        '-headers', (
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n'
-        ),
-        '-i', video_url,
-        # Audio input
-        '-headers', (
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n'
-        ),
-        '-i', audio_url,
-        # Output options
-        '-c:v', 'copy',        # Video: no re-encode (fast)
-        '-c:a', 'aac',         # Audio: encode to AAC (compatible)
-        '-b:a', '128k',
-        '-shortest',           # End when shortest stream finishes
-        '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+faststart',
-        'pipe:1',              # Write to stdout
-    ]
+    import os
 
-    logger.info("Starting ffmpeg merge for DASH stream")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    video_tmp = None
+    audio_tmp = None
+    proc = None
 
     try:
+        # Step 1: Download both streams to temp files
+        logger.info("Downloading video stream to temp file...")
+        video_tmp = await _download_to_temp(video_url, '.mp4')
+
+        logger.info("Downloading audio stream to temp file...")
+        audio_tmp = await _download_to_temp(audio_url, '.m4a')
+
+        # Step 2: ffmpeg merge from temp files
+        cmd = [
+            'ffmpeg',
+            '-loglevel', 'warning',
+            '-i', video_tmp,
+            '-i', audio_tmp,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-shortest',
+            '-f', 'mp4',
+            '-movflags', 'frag_keyframe+empty_moov+faststart',
+            'pipe:1',
+        ]
+
+        logger.info("Starting ffmpeg merge from temp files")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Step 3: Stream output chunks
         while True:
-            chunk = await proc.stdout.read(8192)
+            chunk = await proc.stdout.read(65536)
             if not chunk:
                 break
             yield chunk
 
         await proc.wait()
 
+        stderr_out = await proc.stderr.read()
         if proc.returncode != 0:
-            stderr_output = await proc.stderr.read()
-            logger.error(f"ffmpeg error (code {proc.returncode}): {stderr_output.decode()}")
+            logger.error(f"ffmpeg error (code {proc.returncode}): {stderr_out.decode()}")
         else:
             logger.info("ffmpeg merge completed successfully")
+            if stderr_out:
+                logger.debug(f"ffmpeg warnings: {stderr_out.decode()}")
 
     except Exception as e:
-        logger.error(f"ffmpeg stream error: {e}")
-        proc.kill()
+        logger.error(f"ffmpeg merge error: {e}")
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         raise
+
+    finally:
+        # Step 4: Cleanup temp files
+        for tmp_path in (video_tmp, audio_tmp):
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                    logger.debug(f"Cleaned up temp file: {tmp_path}")
+                except Exception:
+                    pass
 
 
 @app.get("/stream/{video_id}")
